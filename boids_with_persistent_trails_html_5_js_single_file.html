@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Reynolds Flocking — Persistent Trails (HTML5/JS)</title>
+  <style>
+    :root{
+      --bg:#0b0b10; --panel:#111116; --muted:#a1a1aa; --text:#e5e7eb; --accent:#22c55e; --accent2:#6366f1;
+      --border:#27272a;
+    }
+    html,body{height:100%;}
+    body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, sans-serif;}
+    .wrap{max-width:1100px;margin:0 auto;padding:24px;}
+    h1{font-size:22px;margin:0 0 8px}
+    p.lead{color:var(--muted);margin:0 0 16px}
+    .controls{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;margin:0 0 12px}
+    .control{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:8px 10px}
+    .control label{display:block;font-size:11px;color:#9ca3af;margin-bottom:4px}
+    .control input{background:transparent;border:none;outline:none;color:var(--text);width:100px;font-size:14px}
+    .buttons{display:flex;gap:8px}
+    button{border:none;border-radius:14px;padding:9px 14px;color:white;background:#222;cursor:pointer;transition:.15s ease;}
+    button.start{background:var(--accent)}
+    button.pause{background:var(--accent2)}
+    button.reset{background:#3f3f46}
+    button:hover{filter:brightness(1.05)}
+    .elapsed{margin-left:auto;color:#9ca3af;align-self:center}
+    .stage{position:relative;height:68vh;min-height:420px;background:#0a0a0f;border:1px solid var(--border);border-radius:18px;overflow:hidden;box-shadow:0 10px 30px rgba(0,0,0,.25)}
+    canvas{position:absolute;inset:0;width:100%;height:100%}
+    details{margin-top:10px;color:#cbd5e1}
+    details summary{cursor:pointer}
+    .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:8px;margin-top:8px}
+    .grid label{display:flex;justify-content:space-between;align-items:center;background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:8px 10px}
+    .grid input{width:90px;text-align:right}
+    .note{color:#8b8b98;font-size:12px;margin-top:6px}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Reynolds Flocking — Persistent Trails</h1>
+    <p class="lead">HTML5/JS, client-only. Boids leave path marks on a persistent canvas. Set boid count and duration to keep it from running forever.</p>
+
+    <div class="controls">
+      <div class="control">
+        <label>Boids</label>
+        <input id="boidsCount" type="number" min="10" max="1500" step="10" value="140" />
+      </div>
+      <div class="control">
+        <label>Duration (s)</label>
+        <input id="duration" type="number" min="3" max="600" step="1" value="30" />
+      </div>
+      <div class="buttons">
+        <button class="start" id="startBtn">Start</button>
+        <button class="pause" id="pauseBtn">Pause</button>
+        <button class="reset" id="resetBtn">Reset</button>
+      </div>
+      <div class="elapsed"><span id="elapsed">0.0</span>s / <span id="limit">30</span>s</div>
+    </div>
+
+    <div id="stage" class="stage">
+      <canvas id="trail"></canvas>
+      <canvas id="boids"></canvas>
+    </div>
+
+    <details>
+      <summary>Advanced parameters</summary>
+      <div class="grid" id="paramsGrid"></div>
+      <div class="note">Tip: Increase <code>trailAlpha</code> for stronger marks; lower for subtler trails. "Reset" clears the trail layer.</div>
+    </details>
+  </div>
+
+  <script>
+    // ----- Vector utilities -----
+    class Vec2 {
+      constructor(x=0,y=0){this.x=x;this.y=y}
+      add(v){this.x+=v.x;this.y+=v.y;return this}
+      sub(v){this.x-=v.x;this.y-=v.y;return this}
+      mul(s){this.x*=s;this.y*=s;return this}
+      div(s){if(s!==0){this.x/=s;this.y/=s}return this}
+      set(x,y){this.x=x;this.y=y;return this}
+      clone(){return new Vec2(this.x,this.y)}
+      mag(){return Math.hypot(this.x,this.y)}
+      setMag(n){const m=this.mag();if(m>0)this.mul(n/m);return this}
+      limit(max){const m=this.mag();if(m>max)this.mul(max/m);return this}
+      static sub(a,b){return new Vec2(a.x-b.x,a.y-b.y)}
+    }
+
+    // ----- Spatial Hash Grid -----
+    class SpatialHash{
+      constructor(cell,w,h){this.cell=cell;this.w=w;this.h=h;this.map=new Map()}
+      key(ix,iy){return ix+","+iy}
+      cellIndex(x,y){return [Math.floor(x/this.cell),Math.floor(y/this.cell)]}
+      clear(){this.map.clear()}
+      insert(obj,x,y){const [ix,iy]=this.cellIndex(x,y);const k=this.key(ix,iy);if(!this.map.has(k))this.map.set(k,[]);this.map.get(k).push(obj)}
+      query(x,y,r){const minx=Math.floor((x-r)/this.cell),maxx=Math.floor((x+r)/this.cell);const miny=Math.floor((y-r)/this.cell),maxy=Math.floor((y+r)/this.cell);const out=[];for(let ix=minx;ix<=maxx;ix++){for(let iy=miny;iy<=maxy;iy++){const arr=this.map.get(this.key(ix,iy));if(arr)out.push(...arr)}}return out}
+    }
+
+    class Boid{
+      constructor(x,y,ang,speed,hue){
+        this.pos=new Vec2(x,y);
+        this.vel=new Vec2(Math.cos(ang),Math.sin(ang)).setMag(speed);
+        this.acc=new Vec2();
+        this.prev=this.pos.clone();
+        this.hue=hue;
+      }
+    }
+
+    const params = {
+      maxSpeed: 140,       // px/s
+      maxForce: 200,       // px/s^2
+      neighborRadius: 60,
+      separationRadius: 28,
+      alignWeight: 0.9,
+      cohesionWeight: 0.8,
+      separationWeight: 1.3,
+      trailWidth: 1.4,
+      trailAlpha: 0.22,
+      marginBounce: 8
+    };
+
+    // Hook up params UI dynamically
+    const P_KEYS = Object.keys(params);
+
+    const el = {
+      stage: document.getElementById('stage'),
+      boids: document.getElementById('boids'),
+      trail: document.getElementById('trail'),
+      count: document.getElementById('boidsCount'),
+      duration: document.getElementById('duration'),
+      start: document.getElementById('startBtn'),
+      pause: document.getElementById('pauseBtn'),
+      reset: document.getElementById('resetBtn'),
+      elapsed: document.getElementById('elapsed'),
+      limit: document.getElementById('limit'),
+      paramsGrid: document.getElementById('paramsGrid')
+    };
+
+    function buildParamsUI(){
+      el.paramsGrid.innerHTML = '';
+      for(const k of P_KEYS){
+        const wrap = document.createElement('label');
+        wrap.innerHTML = `<span style="font-size:12px;color:#9ca3af">${k}</span>`;
+        const input = document.createElement('input');
+        input.type = 'number';
+        input.step = '0.1';
+        input.value = params[k];
+        input.addEventListener('change', ()=>{ params[k] = parseFloat(input.value); });
+        wrap.appendChild(input);
+        el.paramsGrid.appendChild(wrap);
+      }
+    }
+
+    buildParamsUI();
+
+    // ----- Canvas sizing -----
+    function resize(){
+      const w = el.stage.clientWidth;
+      const h = el.stage.clientHeight;
+      for(const c of [el.boids, el.trail]){
+        const ratio = window.devicePixelRatio || 1;
+        c.width = Math.floor(w*ratio);
+        c.height = Math.floor(h*ratio);
+        c.style.width = w+'px';
+        c.style.height = h+'px';
+        const ctx=c.getContext('2d');
+        ctx.setTransform(ratio,0,0,ratio,0,0);
+      }
+      grid = new SpatialHash(48,w,h);
+    }
+    window.addEventListener('resize', resize);
+
+    // ----- Simulation state -----
+    let boids = [];
+    let grid = null;
+    let running = false;
+    let raf = 0;
+    let lastT = 0;
+    let startT = 0;
+
+    function initBoids(n){
+      const w = el.stage.clientWidth, h = el.stage.clientHeight;
+      boids.length = 0;
+      for(let i=0;i<n;i++){
+        const x=Math.random()*w, y=Math.random()*h, ang=Math.random()*Math.PI*2;
+        const speed = params.maxSpeed*(0.3 + Math.random()*0.4);
+        const hue = Math.floor(360*(i/n));
+        boids.push(new Boid(x,y,ang,speed,hue));
+      }
+    }
+
+    function clearCanvases(){
+      const w = el.stage.clientWidth, h = el.stage.clientHeight;
+      el.boids.getContext('2d').clearRect(0,0,w,h);
+      el.trail.getContext('2d').clearRect(0,0,w,h);
+    }
+
+    function drawBoid(ctx,b){
+      const angle = Math.atan2(b.vel.y,b.vel.x);
+      const size = 6;
+      ctx.save();
+      ctx.translate(b.pos.x,b.pos.y);
+      ctx.rotate(angle);
+      ctx.beginPath();
+      ctx.moveTo(8,0); ctx.lineTo(-size,size*0.6); ctx.lineTo(-size,-size*0.6); ctx.closePath();
+      ctx.fillStyle = `hsl(${b.hue} 80% 60%)`;
+      ctx.fill();
+      ctx.restore();
+    }
+
+    function drawTrailSegment(ctx,b){
+      ctx.beginPath();
+      ctx.moveTo(b.prev.x,b.prev.y);
+      ctx.lineTo(b.pos.x,b.pos.y);
+      ctx.lineWidth = params.trailWidth;
+      ctx.strokeStyle = `hsla(${b.hue} 80% 60% / ${params.trailAlpha})`;
+      ctx.stroke();
+    }
+
+    function step(dt){
+      const w = el.stage.clientWidth, h = el.stage.clientHeight;
+      grid.clear();
+      for(const b of boids) grid.insert(b,b.pos.x,b.pos.y);
+
+      for(const b of boids){
+        const neighbors = grid.query(b.pos.x,b.pos.y, params.neighborRadius);
+        let align = new Vec2();
+        let cohesion = new Vec2();
+        let separation = new Vec2();
+        let count = 0, sepCount=0;
+        for(const other of neighbors){
+          if(other===b) continue;
+          const dx = other.pos.x-b.pos.x, dy = other.pos.y-b.pos.y;
+          const d2 = dx*dx+dy*dy; if(d2===0) continue; const d=Math.sqrt(d2);
+          if(d < params.neighborRadius){
+            align.add(other.vel);
+            cohesion.add(other.pos);
+            count++;
+          }
+          if(d < params.separationRadius){
+            separation.add(new Vec2(dx,dy).mul(-1/(d+1e-6)));
+            sepCount++;
+          }
+        }
+        const steer = new Vec2();
+        if(count>0){
+          align.div(count).setMag(params.maxSpeed).sub(b.vel).limit(params.maxForce).mul(params.alignWeight);
+          const target = cohesion.div(count);
+          const desired = Vec2.sub(target,b.pos).setMag(params.maxSpeed);
+          const coh = desired.sub(b.vel).limit(params.maxForce).mul(params.cohesionWeight);
+          steer.add(align).add(coh);
+        }
+        if(sepCount>0){
+          const sep = separation.div(sepCount).setMag(params.maxSpeed).sub(b.vel).limit(params.maxForce).mul(params.separationWeight);
+          steer.add(sep);
+        }
+        steer.limit(params.maxForce);
+        b.acc.add(steer);
+      }
+
+      // integrate + toroidal wrap
+      for(const b of boids){
+        const prev = b.pos.clone();
+        b.vel.add(b.acc.mul(dt)).limit(params.maxSpeed);
+        b.pos.add(b.vel.clone().mul(dt));
+        b.acc.set(0,0);
+
+        let wrapped = false;
+        if (b.pos.x < 0) { b.pos.x += w; wrapped = true; }
+        else if (b.pos.x >= w) { b.pos.x -= w; wrapped = true; }
+        if (b.pos.y < 0) { b.pos.y += h; wrapped = true; }
+        else if (b.pos.y >= h) { b.pos.y -= h; wrapped = true; }
+
+        // If we wrapped, break the trail to avoid a long line across the canvas
+        b.prev = wrapped ? b.pos.clone() : prev;
+      }
+
+      // draw
+      const tctx = el.trail.getContext('2d');
+      for(const b of boids) drawTrailSegment(tctx,b);
+
+      const bctx = el.boids.getContext('2d');
+      bctx.clearRect(0,0,w,h);
+      for(const b of boids) drawBoid(bctx,b);
+    }
+
+    function loop(t){
+      if(!running) return;
+      if(!lastT) lastT=t;
+      if(!startT) startT=t;
+      const dt = Math.min(0.05,(t-lastT)/1000); // clamp dt
+      lastT=t;
+      const elapsed = (t-startT)/1000;
+      el.elapsed.textContent = elapsed.toFixed(1);
+      step(dt);
+      const limit = parseFloat(el.duration.value)||30;
+      if(elapsed >= limit){ pause(); return; }
+      raf = requestAnimationFrame(loop);
+    }
+
+    function start(){
+      clearCanvases();
+      initBoids(Math.max(10, Math.min(1500, parseInt(el.count.value||'0',10))));
+      el.limit.textContent = parseInt(el.duration.value||'30',10);
+      lastT=0; startT=0; running=true; raf=requestAnimationFrame(loop);
+    }
+
+    function pause(){ running=false; cancelAnimationFrame(raf); }
+
+    function resume(){ if(running) return; running=true; raf=requestAnimationFrame((t)=>{ lastT=t; raf=requestAnimationFrame(loop); }); }
+
+    function reset(){ pause(); clearCanvases(); boids.length=0; el.elapsed.textContent='0.0'; }
+
+    // Controls
+    el.start.addEventListener('click', start);
+    el.pause.addEventListener('click', ()=> running ? pause() : resume());
+    el.reset.addEventListener('click', reset);
+
+    // Initial setup
+    resize();
+    // Optional: kick off an idle background with no boids drawn
+  </script>
+</body>
+</html>
